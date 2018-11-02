@@ -3,7 +3,7 @@ repository:
     path: github.com/benwtr/passenger_exporter
 build:
     binaries:
-        - name: passenger_exporter_nginx
+        - name: passenger_exporter
     flags: -a -tags -installsuffix
     ldflags: |
         -X {{repoPath}}/vendor/github.com/prometheus/common/version.Version={{.Version}}
