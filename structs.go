@@ -36,6 +36,7 @@ type Group struct {
 	EnabledProcessCount   string    `xml:"enabled_process_count"`
 	DisableWaitListSize   string    `xml:"disable_wait_list_size"`
 	GID                   string    `xml:"gid"`
+	ResistingDeploymentError *struct{} `xml:"resisting_deployment_error"`
 	ProcessesSpawning     string    `xml:"processes_being_spawned"`
 	Options               Options   `xml:"options"`
 	Processes             []Process `xml:"processes>process"`

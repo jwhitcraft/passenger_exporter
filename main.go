@@ -55,6 +55,7 @@ type Exporter struct {
 	appQueue         *prometheus.Desc
 	appGroupQueue    *prometheus.Desc
 	appProcsSpawning *prometheus.Desc
+	resistingDeploymentError *prometheus.Desc
 
 	// Process metrics.
 	requestsProcessed *prometheus.Desc
@@ -78,7 +79,7 @@ func NewExporter(cmd string, timeout time.Duration) *Exporter {
 		version: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "version"),
 			"Version of passenger",
-			[]string{"version"},
+			[]string{"version", "name"},
 			nil,
 		),
 		toplevelQueue: prometheus.NewDesc(
@@ -103,6 +104,12 @@ func NewExporter(cmd string, timeout time.Duration) *Exporter {
 			prometheus.BuildFQName(namespace, "", "app_count"),
 			"Number of apps.",
 			nil,
+			nil,
+		),
+		resistingDeploymentError: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "", "resisting_deployment_error"),
+			"Passenger is in Resisting deployment error mode.",
+			[]string{"name"},
 			nil,
 		),
 		appQueue: prometheus.NewDesc(
@@ -147,7 +154,7 @@ func NewExporter(cmd string, timeout time.Duration) *Exporter {
 // Collect fetches the statistics from the configured passenger frontend, and
 // delivers them as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	info, err := e.status()
+	infos, err := e.statusAll()
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
 		log.Errorf("failed to collect status from passenger: %s", err)
@@ -155,41 +162,70 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1)
 
-	ch <- prometheus.MustNewConstMetric(e.version, prometheus.GaugeValue, 1, info.PassengerVersion)
+	var (
+		topLevelRequestsInQueue float64
+		maxProcessCount float64
+		currentProcessCount float64
+		appCount float64
+	)
+	for _, info := range infos {
+		topLevelRequestsInQueue += parseFloat(info.TopLevelRequestsInQueue)
+		maxProcessCount += parseFloat(info.MaxProcessCount)
+		currentProcessCount += parseFloat(info.CurrentProcessCount)
 
-	ch <- prometheus.MustNewConstMetric(e.toplevelQueue, prometheus.GaugeValue, parseFloat(info.TopLevelRequestsInQueue))
-	ch <- prometheus.MustNewConstMetric(e.maxProcessCount, prometheus.GaugeValue, parseFloat(info.MaxProcessCount))
-	ch <- prometheus.MustNewConstMetric(e.currentProcessCount, prometheus.GaugeValue, parseFloat(info.CurrentProcessCount))
-	ch <- prometheus.MustNewConstMetric(e.appCount, prometheus.GaugeValue, parseFloat(info.AppCount))
+		if info.AppCount != "" {
+			appCount += parseFloat(info.AppCount)
+		}
 
-	for _, sg := range info.SuperGroups {
-		ch <- prometheus.MustNewConstMetric(e.appQueue, prometheus.GaugeValue, parseFloat(sg.RequestsInQueue), sg.Name)
-		ch <- prometheus.MustNewConstMetric(e.appProcsSpawning, prometheus.GaugeValue, parseFloat(sg.Group.ProcessesSpawning), sg.Name)
+		for _, sg := range info.SuperGroups {
+			if sg.Group.ResistingDeploymentError != nil {
+				ch <- prometheus.MustNewConstMetric(e.resistingDeploymentError, prometheus.GaugeValue, 1, sg.Name)
+			}
+			ch <- prometheus.MustNewConstMetric(e.version, prometheus.GaugeValue, 1, info.PassengerVersion, sg.Name)
+			ch <- prometheus.MustNewConstMetric(e.appQueue, prometheus.GaugeValue, parseFloat(sg.RequestsInQueue), sg.Name)
+			ch <- prometheus.MustNewConstMetric(e.appProcsSpawning, prometheus.GaugeValue, parseFloat(sg.Group.ProcessesSpawning), sg.Name)
 
-		ch <- prometheus.MustNewConstMetric(e.appGroupQueue, prometheus.GaugeValue, parseFloat(sg.Group.GetWaitListSize), sg.Group.Default)
+			ch <- prometheus.MustNewConstMetric(e.appGroupQueue, prometheus.GaugeValue, parseFloat(sg.Group.GetWaitListSize), sg.Group.Default)
 
-		// Update process identifiers map.
-		processIdentifiers = updateProcesses(processIdentifiers, sg.Group.Processes)
-		for _, proc := range sg.Group.Processes {
-			if bucketID, ok := processIdentifiers[proc.PID]; ok {
-				ch <- prometheus.MustNewConstMetric(e.procMemory, prometheus.GaugeValue, parseFloat(proc.RealMemory), sg.Name, strconv.Itoa(bucketID))
-				ch <- prometheus.MustNewConstMetric(e.requestsProcessed, prometheus.CounterValue, parseFloat(proc.RequestsProcessed), sg.Name, strconv.Itoa(bucketID))
+			// Update process identifiers map.
+			processIdentifiers = updateProcesses(processIdentifiers, sg.Group.Processes)
+			for _, proc := range sg.Group.Processes {
+				if bucketID, ok := processIdentifiers[proc.PID]; ok {
+					ch <- prometheus.MustNewConstMetric(e.procMemory, prometheus.GaugeValue, parseFloat(proc.RealMemory), sg.Name, strconv.Itoa(bucketID))
+					ch <- prometheus.MustNewConstMetric(e.requestsProcessed, prometheus.CounterValue, parseFloat(proc.RequestsProcessed), sg.Name, strconv.Itoa(bucketID))
 
-				if startTime, err := strconv.Atoi(proc.SpawnStartTime); err == nil {
-					ch <- prometheus.MustNewConstMetric(e.procStartTime, prometheus.GaugeValue, float64(startTime/nanosecondsPerSecond),
-						sg.Name, strconv.Itoa(bucketID), proc.CodeRevision,
-					)
+					if startTime, err := strconv.Atoi(proc.SpawnStartTime); err == nil {
+						ch <- prometheus.MustNewConstMetric(e.procStartTime, prometheus.GaugeValue, float64(startTime/nanosecondsPerSecond),
+							sg.Name, strconv.Itoa(bucketID), proc.CodeRevision,
+						)
+					}
 				}
 			}
 		}
 	}
+	ch <- prometheus.MustNewConstMetric(e.toplevelQueue, prometheus.GaugeValue, topLevelRequestsInQueue)
+	ch <- prometheus.MustNewConstMetric(e.maxProcessCount, prometheus.GaugeValue, maxProcessCount)
+	ch <- prometheus.MustNewConstMetric(e.currentProcessCount, prometheus.GaugeValue, currentProcessCount)
 
+	if appCount != 0 {
+		ch <- prometheus.MustNewConstMetric(e.appCount, prometheus.GaugeValue, appCount)
+	}
 }
 
-func (e *Exporter) status() (*Info, error) {
+func (e *Exporter) statusAll() ([]Info, error) {
+	return e.status("0")
+}
+
+func (e *Exporter) status(pid string) ([]Info, error) {
+	args := e.args
+	if pid != "0" {
+		args = append(args, pid)
+	}
+
 	var (
+		pids []string
 		out bytes.Buffer
-		cmd = exec.Command(e.cmd, e.args...)
+		cmd = exec.Command(e.cmd, args...)
 	)
 	cmd.Stdout = &out
 
@@ -203,16 +239,34 @@ func (e *Exporter) status() (*Info, error) {
 		c <- cmd.Wait()
 	}(cmd, errc)
 
+	infos := []Info{}
+
 	select {
 	case err := <-errc:
 		if err != nil {
-			return nil, err
+			pids, _ = parseErrorOutput(&out)
+			if len(pids) == 0 {
+				return nil, err
+			}
+			for _, pid := range pids {
+				instance_infos, err := e.status(pid)
+				if err == nil {
+					infos = append(infos, instance_infos[0])
+				}
+			}
+			return infos, nil
 		}
 	case <-time.After(e.timeout):
 		return nil, timeoutErr
 	}
 
-	return parseOutput(&out)
+	info, err := parseOutput(&out)
+	if err != nil {
+		return nil, err
+	}
+	infos = append(infos, *info)
+
+	return infos, nil
 }
 
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
@@ -239,6 +293,28 @@ func parseOutput(r io.Reader) (*Info, error) {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func parseErrorOutput(r io.Reader) ([]string, error) {
+	bytes, err := ioutil.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var pids []string
+
+	lines := strings.Split(strings.TrimSpace(string(bytes)), "\n")
+	for i := len(lines)-1; i >= 0; i-- {
+		if len(lines[i]) < 8 {
+			break;
+		} else if lines[i][0:7] != "  PID: " {
+			break;
+		}
+		pid := string(lines[i][7:])
+		pids = append(pids, pid)
+	}
+
+	return pids, nil
 }
 
 func parseFloat(val string) float64 {
