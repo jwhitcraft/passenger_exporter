@@ -1,6 +1,6 @@
 go: 1.10.1
 repository:
-    path: github.com/stuartnelson3/passenger_exporter
+    path: github.com/benwtr/passenger_exporter
 build:
     binaries:
         - name: passenger_exporter_nginx

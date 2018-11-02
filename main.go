@@ -307,7 +307,7 @@ func parseErrorOutput(r io.Reader) ([]string, error) {
 	for i := len(lines)-1; i >= 0; i-- {
 		if len(lines[i]) < 8 {
 			break;
-		} else if lines[i][0:7] != "  PID: " {
+		} else if lines[i][36:41] != "nginx" {
 			break;
 		}
 		pid := string(lines[i][7:])
